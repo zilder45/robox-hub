@@ -243,34 +243,21 @@ end
 
 --================ Workspace scan (groups by name) ================
 local function scanGroups()
-	-- collect renderable top-ish objects: direct children of Workspace or
-	-- children of container models, grouped by name with counts
+	-- DEEP scan: every descendant of Workspace, grouped by name.
+	-- (lag tests spawn spam AFTER script load and often in nested containers)
 	local groups = {}
-	local root = Workspace
-
-	local function addObj(obj, container)
-		local name = obj.Name
-		if name == "" then return end
-		if not (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder")) then
-			-- still count things like ParticleEmitter parents are parts, skip pure services
-			return
-		end
-		local key = name
-		local g = groups[key]
-		if not g then
-			g = { name = name, className = obj.ClassName, objects = {}, container = container }
-			groups[key] = g
-		end
-		table.insert(g.objects, obj)
-	end
-
-	for _, obj in ipairs(root:GetChildren()) do
-		if obj ~= player.Character then
-			addObj(obj, nil)
-			-- one level deep: spam often lives inside a container model/folder
-			if #obj:GetChildren() > 0 and (obj:IsA("Model") or obj:IsA("Folder")) then
-				for _, child in ipairs(obj:GetChildren()) do
-					addObj(child, obj)
+	local char = player.Character
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d ~= char and not (char and d:IsDescendantOf(char)) then
+			if d:IsA("BasePart") or d:IsA("Model") or d:IsA("Folder") then
+				local name = d.Name
+				if name ~= "" then
+					local g = groups[name]
+					if not g then
+						g = { name = name, className = d.ClassName, objects = {} }
+						groups[name] = g
+					end
+					table.insert(g.objects, d)
 				end
 			end
 		end
@@ -348,6 +335,10 @@ end
 
 startAutoHide()
 
+-- auto-rescan: lag tests spawn spam after the script loads --------------
+local rescanNeeded = false
+local function requestRescan() rescanNeeded = true end
+
 -- watch for re-enabled/new spam: keep hidden things hidden ----------------
 task.spawn(function()
 	while true do
@@ -359,6 +350,21 @@ task.spawn(function()
 		for cn in pairs(State.GroupsHidden) do
 			pcall(applyClassState, cn, true)
 		end
+		-- periodic auto-rescan (new spam appears while playing)
+		if rescanNeeded then
+			rescanNeeded = false
+			if _rkIsObjectsTab and _rkIsObjectsTab() then
+				_rkRebuildObjects()
+			end
+		end
+	end
+end)
+
+--================ Workspace watcher: auto-rescan every 5s ================
+task.spawn(function()
+	while true do
+		task.wait(5)
+		requestRescan()
 	end
 end)
 
@@ -473,9 +479,21 @@ titleLbl.TextSize = 18
 titleLbl.TextXAlignment = Enum.TextXAlignment.Left
 titleLbl.Parent = win
 
+-- object counter (live): shows how many renderable objects exist right now
+local objCountLbl = Instance.new("TextLabel")
+objCountLbl.Size = UDim2.new(0, 140, 0, 24)
+objCountLbl.Position = UDim2.new(0, 320, 0, 8)
+objCountLbl.BackgroundTransparency = 1
+objCountLbl.Text = ""
+objCountLbl.TextColor3 = C.Sub
+objCountLbl.Font = Enum.Font.GothamMedium
+objCountLbl.TextSize = 11
+objCountLbl.TextXAlignment = Enum.TextXAlignment.Left
+objCountLbl.Parent = win
+
 local searchBox = Instance.new("TextBox")
-searchBox.Size = UDim2.new(0, 200, 0, 24)
-searchBox.Position = UDim2.new(0, 548, 0, 8)
+searchBox.Size = UDim2.new(0, 160, 0, 24)
+searchBox.Position = UDim2.new(0, 588, 0, 8)
 searchBox.BackgroundColor3 = C.Input
 searchBox.Text = ""
 searchBox.PlaceholderText = "Поиск..."
@@ -491,6 +509,22 @@ corner(searchBox, 5)
 local searchPad = Instance.new("UIPadding")
 searchPad.PaddingLeft = UDim.new(0, 8)
 searchPad.Parent = searchBox
+
+-- rescan button (topbar, left of search)
+local rescanBtn = Instance.new("TextButton")
+rescanBtn.Size = UDim2.new(0, 60, 0, 24)
+rescanBtn.Position = UDim2.new(0, 524, 0, 8)
+rescanBtn.BackgroundColor3 = C.Input
+rescanBtn.Text = "Rescan"
+rescanBtn.TextColor3 = C.Sub
+rescanBtn.Font = Enum.Font.GothamBold
+rescanBtn.TextSize = 11
+rescanBtn.AutoButtonColor = false
+rescanBtn.BorderSizePixel = 0
+rescanBtn.Parent = win
+corner(rescanBtn, 5)
+rescanBtn.MouseEnter:Connect(function() tween(rescanBtn, 0.12, {TextColor3 = C.Accent}) end)
+rescanBtn.MouseLeave:Connect(function() tween(rescanBtn, 0.12, {TextColor3 = C.Sub}) end)
 
 -- settings card
 local card = Instance.new("Frame")
@@ -831,10 +865,91 @@ local function applySearch(rows)
 	end
 end
 
+--================ Object Picker (find spam by clicking it in the world) ================
+-- Enable picker -> click any object in the world -> the script highlights it,
+-- shows its name/path and selects its group in the list.
+local picking = false
+local pickHighlight = nil
+local pickedInfo = ""
+
+local function clearPickHighlight()
+	if pickHighlight then
+		pcall(function()
+			pickHighlight:Destroy()
+		end)
+		pickHighlight = nil
+	end
+end
+
+local function startPicking()
+	if picking then return end
+	picking = true
+	pickedInfo = "PICKING... click the object in the world"
+end
+
+local function onPickClicked(hit)
+	-- hit = BasePart the mouse clicked
+	if not hit then return end
+	local char = player.Character
+	if char and hit:IsDescendantOf(char) then return end
+	if not hit:IsDescendantOf(Workspace) then return end
+
+	-- walk up to a meaningful "object": the ancestor right below Workspace
+	-- (or the part itself if it IS a direct child)
+	local target = hit
+	while target.Parent and target.Parent ~= Workspace do
+		target = target.Parent
+	end
+
+	-- highlight the picked part (SelectionBox works client-side)
+	clearPickHighlight()
+	local okSB, sb = pcall(function()
+		local box = Instance.new("SelectionBox")
+		box.Adornee = hit
+		box.LineThickness = 0.05
+		box.Color3 = C.Accent
+		box.Parent = gui
+		return box
+	end)
+	if okSB then pickHighlight = sb end
+
+	-- report + select group in list + filter search
+	local targetName = target.Name ~= "" and target.Name or hit.Name
+	selectedRow = targetName
+	local okPath, path = pcall(function() return target:GetFullName() end)
+	pickedInfo = "PICKED: " .. targetName .. "\n" .. (okPath and path or "?") .. "\nCount now: " .. tostring(#findGroup(targetName))
+	-- auto-fill search so the list jumps to that group
+	searchBox.Text = targetName
+	picking = false
+end
+
+player:GetMouse().Button1Down:Connect(function()
+	if not picking then return end
+	local m = player:GetMouse()
+	if m and m.Target then
+		onPickClicked(m.Target)
+	end
+end)
+
 --================ Tab: OBJECTS (group rows) ================
 local function buildObjectsCard(g)
 	clearCard()
 	cardTitle.Text = g.name .. "  (" .. #g.objects .. ")"
+
+	-- picker status line (live)
+	infoWidget(cardHolder, function()
+		if picking then return "PICKING... click the object in the world (under the cursor)" end
+		if pickedInfo ~= "" then return pickedInfo end
+		return "Tip: 'Pick Object' then click the spam in the world to find its name here."
+	end)
+
+	buttonWidget(cardHolder, "Pick Object (Click in World)", function()
+		if picking then
+			picking = false
+		else
+			startPicking()
+		end
+	end)
 
 	toggleWidget(cardHolder, "Hide All (" .. #g.objects .. ")", function()
 		return State.Hidden[g.name] == true
@@ -887,6 +1002,7 @@ local function buildObjectsCard(g)
 		end)
 	end
 end
+
 
 local function buildObjectsTab()
 	clearRows()
@@ -1176,6 +1292,10 @@ end
 
 -- tabs
 local tabObjects = addTab("Objects", "O", buildObjectsTab)
+
+-- hooks for the watchdog loop (declared as globals-on-purpose, set after tabs exist)
+_rkIsObjectsTab = function() return currentTab == tabObjects end
+_rkRebuildObjects = buildObjectsTab
 local tabClasses = addTab("Classes", "C", buildClassesTab)
 local tabSettings = addTab("Settings", "S", buildSettingsTab)
 
@@ -1185,7 +1305,16 @@ refreshUI = function(tab)
 	if tab == tabObjects then buildObjectsTab()
 	elseif tab == tabClasses then buildClassesTab()
 	else buildSettingsTab() end
+	-- update live counter
+	local groups = scanGroups()
+	local total = 0
+	for _, g in ipairs(groups) do total += #g.objects end
+	objCountLbl.Text = "Objects: " .. total .. " (" .. #groups .. " groups)"
 end
+
+rescanBtn.MouseButton1Click:Connect(function()
+	refreshUI(currentTab)
+end)
 
 searchBox:GetPropertyChangedSignal("Text"):Connect(function()
 	refreshUI(currentTab)

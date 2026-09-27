@@ -110,10 +110,36 @@ local function getGuiParent()
 end
 
 --================ Hide / Restore engine ================
--- "hide" = disable rendering on every descendant part:
--- Transparency 1, CanCollide/CanQuery/CanTouch false, Material Plastic.
+-- "hide" disables rendering of EVERYTHING renderable:
+--   BasePart: Transparency 1, CanCollide/CanQuery/CanTouch false, Material Plastic,
+--             + all child Decals/Textures/ParticleEmitters/Beams/Trails/Effects off
+--   ParticleEmitter / Beam / Trail / Fire / Smoke / Sparkles / Light: .Enabled = false
+--   Decal / Texture: Transparency 1
 -- Original properties are remembered and fully restored.
-local savedProps = {}  -- [BasePart] = {transparency, canCollide, canQuery, canTouch, material, decals}
+local savedProps = {}  -- [Instance] = record
+
+local EFFECT_CLASSES = {
+	ParticleEmitter = true, Beam = true, Trail = true,
+	Fire = true, Smoke = true, Sparkles = true,
+	Explosion = true, Highlight = true,
+}
+
+local LIGHT_CLASSES = {
+	PointLight = true, SpotLight = true, SurfaceLight = true,
+}
+
+local function isEffect(obj)
+	return EFFECT_CLASSES[obj.ClassName] == true
+end
+
+local function isLight(obj)
+	return LIGHT_CLASSES[obj.ClassName] == true
+end
+
+local function isRenderable(obj)
+	return obj:IsA("BasePart") or obj:IsA("Decal") or obj:IsA("Texture")
+		or isEffect(obj) or isLight(obj)
+end
 
 local function savePart(obj)
 	if savedProps[obj] then return end
@@ -136,6 +162,8 @@ local function savePart(obj)
 		end
 	elseif obj:IsA("Decal") or obj:IsA("Texture") then
 		rec = { transparency = obj.Transparency }
+	elseif isEffect(obj) or isLight(obj) then
+		rec = { enabled = obj.Enabled }
 	end
 	if rec then savedProps[obj] = rec end
 end
@@ -153,10 +181,16 @@ local function applyHidden(obj)
 			for _, d in ipairs(obj:GetChildren()) do
 				if d:IsA("Decal") or d:IsA("Texture") then
 					d.Transparency = 1
+				elseif d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail")
+					or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles") then
+					savePart(d)
+					d.Enabled = false
 				end
 			end
 		elseif obj:IsA("Decal") or obj:IsA("Texture") then
 			obj.Transparency = 1
+		elseif isEffect(obj) or isLight(obj) then
+			obj.Enabled = false
 		end
 	end)
 end
@@ -178,6 +212,8 @@ local function restorePart(obj)
 			end
 		elseif obj:IsA("Decal") or obj:IsA("Texture") then
 			obj.Transparency = rec.transparency
+		elseif isEffect(obj) or isLight(obj) then
+			if rec.enabled ~= nil then obj.Enabled = rec.enabled end
 		end
 	end)
 	savedProps[obj] = nil
@@ -187,12 +223,12 @@ end
 local function hideObject(obj)
 	if not obj or not obj.Parent then return end
 	for _, d in ipairs(obj:GetDescendants()) do
-		if d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture") then
+		if isRenderable(d) then
 			savePart(d)
 			applyHidden(d)
 		end
 	end
-	if obj:IsA("BasePart") or obj:IsA("Decal") or obj:IsA("Texture") then
+	if isRenderable(obj) then
 		savePart(obj)
 		applyHidden(obj)
 	end
@@ -210,7 +246,12 @@ end
 local function findGroup(name)
 	local out = {}
 	for _, d in ipairs(Workspace:GetDescendants()) do
-		if d.Name == name then table.insert(out, d) end
+		if d.Name == name then
+			table.insert(out, d)
+		elseif (isEffect(d) or isLight(d)) and d.Parent and d.Parent.Name == name then
+			-- effect grouped under its holder's name
+			table.insert(out, d)
+		end
 	end
 	return out
 end
@@ -242,23 +283,37 @@ local function applyClassState(className, hidden)
 end
 
 --================ Workspace scan (groups by name) ================
+-- DEEP scan: every descendant of Workspace, grouped by name.
+-- Includes EFFECTS (ParticleEmitter/Beam/Trail/Fire/Smoke/Sparkles) — lag tests
+-- often "spawn cubes" as particle emitters or effects, not real parts.
+-- Groups an effect under the NAME of its PARENT part/model (so "400 cubes
+-- falling from sky" = one group = one toggle).
 local function scanGroups()
-	-- DEEP scan: every descendant of Workspace, grouped by name.
-	-- (lag tests spawn spam AFTER script load and often in nested containers)
 	local groups = {}
 	local char = player.Character
 	for _, d in ipairs(Workspace:GetDescendants()) do
 		if d ~= char and not (char and d:IsDescendantOf(char)) then
-			if d:IsA("BasePart") or d:IsA("Model") or d:IsA("Folder") then
-				local name = d.Name
-				if name ~= "" then
-					local g = groups[name]
-					if not g then
-						g = { name = name, className = d.ClassName, objects = {} }
-						groups[name] = g
+			local isObj = d:IsA("BasePart") or d:IsA("Model") or d:IsA("Folder")
+				or d:IsA("Decal") or d:IsA("Texture") or isEffect(d) or isLight(d)
+			if isObj and d.Name ~= "" then
+				local name
+				if isEffect(d) or isLight(d) then
+					-- group by the HOLDER (parent part) name: that's what makes sense
+					local holder = d.Parent
+					if holder and holder ~= Workspace and holder.Name ~= "" then
+						name = holder.Name
+					else
+						name = d.Name
 					end
-					table.insert(g.objects, d)
+				else
+					name = d.Name
 				end
+				local g = groups[name]
+				if not g then
+					g = { name = name, className = d.ClassName, objects = {} }
+					groups[name] = g
+				end
+				table.insert(g.objects, d)
 			end
 		end
 	end
